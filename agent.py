@@ -39,71 +39,101 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "Moon Lily"
+AGENT_NAME = "HandRatingBot"
 
 
 # ===== YOUR CODE HERE =====
+from collections import Counter
+from itertools import combinations
+from evaluator import category_name, get_table
+
+# Edit these defaults before submitting. Environment overrides help local testing.
+RISK_LEVEL = 0.5  # 0.0 = cautious, 0.5 = balanced, 1.0 = aggressive
+SHOW_RATINGS = False  # True prints every decision in the bot's terminal.
+CATEGORY_RATINGS = (5, 20, 35, 50, 60, 75, 85, 95, 100)
+
+
+def rate_hand(hole_cards, board):
+    """Return an absolute heuristic rating, never a probability of winning."""
+    if not board:
+        ranks = Counter(card_rank(card) for card in hole_cards)
+        suits = Counter(card_suit(card) for card in hole_cards)
+        high_cards = sum(card_rank(card) for card in hole_cards) / 40
+        pairs = sum(1 + rank / 8 for rank, count in ranks.items() if count >= 2)
+        suited_pairs = sum(count >= 2 for count in suits.values())
+        connected = sum(rank + 1 in ranks for rank in ranks)
+        rating = min(80.0, 10 + 25 * high_cards + 10 * pairs
+                     + 7 * suited_pairs + 3 * connected)
+        return {"rating": round(rating, 1), "category": "preflop potential",
+                "score": None, "best_hand": ""}
+
+    # This also works on the flop and turn, where omaha_score requires 5 board cards.
+    table = get_table()
+    candidates = (
+        pair + triple
+        for pair in combinations(hole_cards, 2)
+        for triple in combinations(board, 3)
+    )
+    best_hand = max(candidates, key=lambda cards: table[sum(1 << c for c in cards)])
+    score = table[sum(1 << c for c in best_hand)]
+    category = score >> 20
+    # The official packed score supplies exact tie breaks within each category.
+    kicker_fraction = (score & ((1 << 20) - 1)) / 0x88888
+    rating = min(100.0, CATEGORY_RATINGS[category] + 4 * kicker_fraction)
+    return {"rating": round(rating, 1), "category": category_name(score),
+            "score": score, "best_hand": cards_to_str(best_hand)}
+
+
+def select_action(obs, rating, risk_level):
+    """Higher risk lowers thresholds. Bet price affects decisions, not ratings."""
+    call_cost = min(obs.to_call, obs.my_stack)
+    price = call_cost / max(1, obs.pot + call_cost)
+    call_threshold = 38 - 20 * risk_level + 25 * price
+    half_threshold = 68 - 20 * risk_level
+    pot_threshold = 86 - 20 * risk_level
+    if rating >= pot_threshold and Action.RAISE_POT in obs.legal_actions:
+        return Action.RAISE_POT
+    if rating >= half_threshold and Action.RAISE_HALF in obs.legal_actions:
+        return Action.RAISE_HALF
+    if obs.to_call == 0 or rating >= call_threshold:
+        return Action.CHECK_CALL
+    if Action.FOLD in obs.legal_actions:
+        return Action.FOLD
+    return Action.CHECK_CALL
+
 
 def new_half(config: AgentConfig, memory: dict) -> None:
-    """Called at the start of each half-match (1000 hands).
-
-    `memory` is a fresh, empty dict every half. Store anything you want to
-    remember between hands in it, e.g. memory["opp_raises"] = 0.
-    `config` holds the match settings (starting_stack, big_blind, ...).
-
-    In the tournament, each half runs in a brand-new copy of your server,
-    so nothing you learn in one half carries over to the other half.
-    """
+    risk_level = float(os.environ.get("RISK_LEVEL", RISK_LEVEL))
+    if not 0 <= risk_level <= 1:
+        raise ValueError("RISK_LEVEL must be between 0 and 1")
+    memory["risk_level"] = risk_level
+    memory["show_ratings"] = os.environ.get("SHOW_RATINGS", str(int(SHOW_RATINGS))) == "1"
     memory["hands_played"] = 0
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
-
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
-
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
-
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+    # Cache only this hand/street, keeping memory bounded across a half.
+    key = (obs.hand_index, tuple(obs.hole_cards), tuple(obs.board))
+    if memory.get("rating_key") != key:
+        memory["rating_key"] = key
+        memory["hand_rating"] = rate_hand(obs.hole_cards, obs.board)
+    report = dict(memory["hand_rating"])
+    rating = report["rating"]
+    risk = "high" if rating < 40 else "moderate" if rating < 70 else "lower"
+    action = select_action(obs, rating, memory["risk_level"])
+    report.update(hand_index=obs.hand_index, street=obs.street.name,
+                  hand_risk=risk, risk_level=memory["risk_level"], action=action.name)
+    memory["last_decision"] = report
+    if memory["show_ratings"]:
+        print(f"hand={obs.hand_index} street={obs.street.name} "
+              f"rating={rating}/100 category={report['category']} "
+              f"hand_risk={risk} aggression={memory['risk_level']} "
+              f"action={action.name} best={report['best_hand']}", flush=True)
+    return action
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand. Optional: learn from what happened.
-
-    To save time, the judge sends finished hands along with your next
-    decision request, so this always runs BEFORE choose_action() sees the
-    next hand. (The last hands of a half arrive at the end of the half.)
-
-    result has: hand_index, my_net (chips won or lost), pot,
-    went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
-    only after a showdown, else None), winner ('me', 'opp' or 'split').
-    """
     memory["hands_played"] += 1
 
 # ===== END OF YOUR CODE =====
